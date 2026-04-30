@@ -1,20 +1,26 @@
-import { useState, useMemo, useEffect } from 'react';
-import { CLIENTS, OWNERS, ROW_DATA } from './data.js';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { DataTable } from './components/DataTable.jsx';
 import { DetailPanel } from './components/DetailPanel.jsx';
 import { FilterBuilder, applyConditions } from './components/FilterBuilder.jsx';
 import { TweaksPanel, TweakSection, TweakToggle, TweakRadio, TweakColor } from './components/TweaksPanel.jsx';
+import { loadClients, loadRows, loadRowCounts, updateRow, addRow, subscribeToRows, seedIfEmpty } from './lib/db.js';
+import { supabase } from './lib/supabase.js';
 
 export default function App() {
   const [tweaks, setTweaksState] = useState({ density: 'comfortable', darkMode: false, showSidebar: true, accent: '#c54a2c' });
   const setTweak = (key, val) => setTweaksState(t => ({ ...t, [key]: val }));
 
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   const [showTweaks, setShowTweaks] = useState(false);
-  const [activeClientId, setActiveClientId] = useState(CLIENTS[0].id);
-  const [activeSheetId, setActiveSheetId] = useState(CLIENTS[0].seats[0].sheets[0].id);
+
+  const [clients, setClients] = useState([]);
+  const [activeClientId, setActiveClientId] = useState(null);
+  const [activeSheetId, setActiveSheetId] = useState(null);
   const [collapsedSeats, setCollapsedSeats] = useState(new Set());
 
-  const [rowsBySheet, setRowsBySheet] = useState(ROW_DATA);
+  const [rowsBySheet, setRowsBySheet] = useState({});
+  const [rowCounts, setRowCounts] = useState({});
   const [search, setSearch] = useState('');
   const [conditions, setConditions] = useState([]);
   const [showFilter, setShowFilter] = useState(false);
@@ -24,16 +30,72 @@ export default function App() {
   const [hiddenCols, setHiddenCols] = useState(new Set());
   const [toast, setToast] = useState(null);
 
+  const showToast = useCallback((m) => { setToast(m); setTimeout(() => setToast(null), 2200); }, []);
+
   useEffect(() => {
     document.documentElement.style.setProperty('--accent', tweaks.accent);
     document.documentElement.style.setProperty('--accent-soft', tweaks.accent + '14');
   }, [tweaks.accent]);
 
-  const showToast = (m) => { setToast(m); setTimeout(() => setToast(null), 2200); };
+  // ── Init: seed + load ──────────────────────────────────────────────────────
+  useEffect(() => {
+    async function init() {
+      try {
+        await seedIfEmpty();
+        const data = await loadClients();
+        setClients(data);
+        setActiveClientId(data[0]?.id);
+        setActiveSheetId(data[0]?.seats[0]?.sheets[0]?.id);
 
-  const activeClient = CLIENTS.find(c => c.id === activeClientId);
+        const allSheetIds = data.flatMap(c => c.seats.flatMap(s => s.sheets.map(sh => sh.id)));
+        const counts = await loadRowCounts(allSheetIds);
+        setRowCounts(counts);
+      } catch (e) {
+        setLoadError(e.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+    init();
+  }, []);
+
+  // ── Load rows + subscribe when sheet changes ───────────────────────────────
+  useEffect(() => {
+    if (!activeSheetId) return;
+    setSearch(''); setConditions([]); setSort(null);
+    setSelected(new Set()); setOpenedId(null); setHiddenCols(new Set());
+
+    loadRows(activeSheetId).then(rows => {
+      setRowsBySheet(prev => ({ ...prev, [activeSheetId]: rows }));
+      setRowCounts(prev => ({ ...prev, [activeSheetId]: rows.length }));
+    });
+
+    const channel = subscribeToRows(
+      activeSheetId,
+      // on update
+      (updatedRow) => {
+        setRowsBySheet(prev => ({
+          ...prev,
+          [activeSheetId]: (prev[activeSheetId] || []).map(r => r.id === updatedRow.id ? updatedRow : r),
+        }));
+      },
+      // on insert
+      (newRow) => {
+        setRowsBySheet(prev => ({
+          ...prev,
+          [activeSheetId]: [...(prev[activeSheetId] || []), newRow],
+        }));
+        setRowCounts(prev => ({ ...prev, [activeSheetId]: (prev[activeSheetId] || 0) + 1 }));
+      }
+    );
+
+    return () => { supabase.removeChannel(channel); };
+  }, [activeSheetId]);
+
+  const activeClient = clients.find(c => c.id === activeClientId);
 
   const activeSheet = useMemo(() => {
+    if (!activeClient) return null;
     for (const s of activeClient.seats) {
       for (const sh of s.sheets) {
         if (sh.id === activeSheetId) return { seat: s, sheet: sh };
@@ -43,23 +105,30 @@ export default function App() {
     return { seat: s0, sheet: s0.sheets[0] };
   }, [activeClient, activeSheetId]);
 
-  useEffect(() => {
-    setSearch(''); setConditions([]); setSort(null);
-    setSelected(new Set()); setOpenedId(null); setHiddenCols(new Set());
-  }, [activeSheetId]);
-
   const onClient = (id) => {
     setActiveClientId(id);
-    const c = CLIENTS.find(x => x.id === id);
+    const c = clients.find(x => x.id === id);
     setActiveSheetId(c.seats[0].sheets[0].id);
   };
+
+  if (loading) {
+    return (
+      <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)', flexDirection: 'column', gap: 12 }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--ink-3)' }}>
+          {loadError ? `Error: ${loadError}` : 'Loading…'}
+        </div>
+      </div>
+    );
+  }
+
+  if (!activeClient || !activeSheet) return null;
 
   const sheet = activeSheet.sheet;
   const columns = sheet.columns;
   const visibleColumns = columns.filter(c => !hiddenCols.has(c.key));
   const allRows = rowsBySheet[sheet.id] || [];
 
-  const filteredRows = useMemo(() => {
+  const filteredRows = (() => {
     let out = allRows;
     if (search) {
       const q = search.toLowerCase();
@@ -72,14 +141,13 @@ export default function App() {
     if (sort) {
       out = [...out].sort((a, b) => {
         const av = a[sort.col], bv = b[sort.col];
-        if (av == null) return 1;
-        if (bv == null) return -1;
+        if (av == null) return 1; if (bv == null) return -1;
         if (typeof av === 'number') return sort.dir === 'asc' ? av - bv : bv - av;
         return sort.dir === 'asc' ? String(av).localeCompare(String(bv)) : String(bv).localeCompare(String(av));
       });
     }
     return out;
-  }, [allRows, search, conditions, sort]);
+  })();
 
   const onSort = (col, dir) => {
     if (dir) return setSort({ col, dir });
@@ -87,31 +155,47 @@ export default function App() {
   };
 
   const onEdit = (id, key, value) => {
-    setRowsBySheet(rs => ({
-      ...rs,
-      [sheet.id]: rs[sheet.id].map(r => r.id === id ? { ...r, [key]: value } : r),
-    }));
+    const currentRow = allRows.find(r => r.id === id);
+    if (!currentRow) return;
+    const updated = { ...currentRow, [key]: value };
+    // Optimistic
+    setRowsBySheet(rs => ({ ...rs, [sheet.id]: rs[sheet.id].map(r => r.id === id ? updated : r) }));
+    // Persist
+    updateRow(id, updated);
   };
 
   const onAiRun = (idOrIds) => {
     const ids = Array.isArray(idOrIds) ? idOrIds : [idOrIds];
     const aiKey = columns.find(c => c.type === 'AI')?.key;
     if (!aiKey) { showToast('No AI column on this sheet.'); return; }
+
     setRowsBySheet(rs => ({
       ...rs,
       [sheet.id]: rs[sheet.id].map(r => ids.includes(r.id) ? { ...r, enrichPending: true } : r),
     }));
     showToast(`✦ Running on ${ids.length} row${ids.length === 1 ? '' : 's'}…`);
+
     ids.forEach((rid, idx) => setTimeout(() => {
+      const row = (rowsBySheet[sheet.id] || []).find(r => r.id === rid) ||
+                  allRows.find(r => r.id === rid);
+      if (!row) return;
+      const cur = row[aiKey] || 0;
+      const newVal = Math.min(100, cur + 20 + Math.floor(Math.random() * 30));
+      const updated = { ...row, [aiKey]: newVal, enrichPending: false };
       setRowsBySheet(rs => ({
         ...rs,
-        [sheet.id]: rs[sheet.id].map(r => {
-          if (r.id !== rid) return r;
-          const cur = r[aiKey] || 0;
-          return { ...r, [aiKey]: Math.min(100, cur + 20 + Math.floor(Math.random() * 30)), enrichPending: false };
-        }),
+        [sheet.id]: (rs[sheet.id] || []).map(r => r.id === rid ? updated : r),
       }));
+      updateRow(rid, updated);
     }, 800 + idx * 250));
+  };
+
+  const onAddRow = async () => {
+    try {
+      const newRow = await addRow(sheet.id, allRows.length);
+      setRowsBySheet(rs => ({ ...rs, [sheet.id]: [...(rs[sheet.id] || []), newRow] }));
+      setRowCounts(prev => ({ ...prev, [sheet.id]: (prev[sheet.id] || 0) + 1 }));
+    } catch (e) { showToast('Failed to add row'); }
   };
 
   const onSelectRow = (id) => setSelected(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -126,7 +210,6 @@ export default function App() {
   };
 
   const toggleSeat = (id) => setCollapsedSeats(s => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
-
   const appCls = [tweaks.darkMode ? 'dark' : '', 'density-' + tweaks.density].filter(Boolean).join(' ');
 
   return (
@@ -145,7 +228,7 @@ export default function App() {
         </div>
         <span style={{ flex: 1 }} />
         <div style={{ display: 'flex', gap: 4, marginRight: 10 }}>
-          {CLIENTS.map(c => (
+          {clients.map(c => (
             <button key={c.id}
                     className={'client-pill' + (c.id === activeClientId ? ' active' : '')}
                     style={c.id === activeClientId ? { background: c.color, borderColor: c.color, color: '#fff' } : {}}
@@ -167,8 +250,7 @@ export default function App() {
         <button className="btn tiny">{visibleColumns.length}/{columns.length} cols</button>
         <button className="btn tiny">{filteredRows.length}/{allRows.length} rows</button>
         <span className="sep" />
-        <button className={'btn tiny ' + (conditions.length ? 'primary' : '')}
-                onClick={() => setShowFilter(o => !o)}>
+        <button className={'btn tiny ' + (conditions.length ? 'primary' : '')} onClick={() => setShowFilter(o => !o)}>
           ⌕ Filter
           {conditions.length > 0 && (
             <span style={{ background: '#fff', color: 'var(--accent)', borderRadius: 8, padding: '0 5px', marginLeft: 3, fontWeight: 700 }}>
@@ -193,7 +275,7 @@ export default function App() {
             <span className="sep" />
           </>
         )}
-        <button className="btn tiny">＋ Row</button>
+        <button className="btn tiny" onClick={onAddRow}>＋ Row</button>
         {showFilter && (
           <FilterBuilder columns={columns} conditions={conditions}
                          setConditions={setConditions} onClose={() => setShowFilter(false)} />
@@ -230,7 +312,7 @@ export default function App() {
                             onClick={() => setActiveSheetId(sh.id)}>
                       <span style={{ width: 14, flexShrink: 0, opacity: .6 }}>{sh.icon}</span>
                       <span className="nav-label">{sh.name}</span>
-                      <span className="count">{(rowsBySheet[sh.id] || []).length}</span>
+                      <span className="count">{rowCounts[sh.id] ?? '–'}</span>
                     </button>
                   ))}
                   {!collapsed && (
@@ -243,7 +325,7 @@ export default function App() {
               );
             })}
 
-            <button className="seat-header" style={{ color: 'var(--ink-3)', borderStyle: 'dashed' }}>
+            <button className="seat-header" style={{ color: 'var(--ink-3)' }}>
               <span style={{ width: 10 }}>＋</span>
               <span style={{ flex: 1 }}>New seat</span>
             </button>
@@ -292,12 +374,13 @@ export default function App() {
 
       {/* STATUS BAR */}
       <div className="statusbar">
-        <span>● {activeClient.name}</span>
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: activeClient.color, display: 'inline-block' }} />
+        <span>{activeClient.name}</span>
         <span>{activeSheet.seat.name} / {sheet.name}</span>
         <span>{filteredRows.length} rows · {columns.length} cols</span>
-        <span>{selected.size > 0 ? selected.size + ' selected' : ''}</span>
+        {selected.size > 0 && <span>{selected.size} selected</span>}
         <span style={{ flex: 1 }} />
-        <span>last sync 2m ago</span>
+        <span style={{ color: '#2d6c5a' }}>● live</span>
       </div>
 
       {toast && <div className="toast">{toast}</div>}
